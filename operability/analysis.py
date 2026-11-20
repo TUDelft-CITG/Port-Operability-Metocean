@@ -1,22 +1,27 @@
-"""Read-only loading and plotting of existing workspace results."""
+"""Loading and plotting existing results, with standalone map export."""
 
 from __future__ import annotations
 
 import io
 import json
+import logging
+import time
 from html import escape
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Optional
 
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
+from branca.element import JavascriptLink
 
 import port_operability as model
 from .workspace import Registry
 from .products import expected_product, read_archive, verified_product
 
+LOGGER = logging.getLogger("operability")
 RISK_COLOURS = {"Low": "#00cc00", "Medium": "#ffff33",
                 "High": "#ff7f50", "Very high": "#d73027"}
 PROGRESS_COLOURS = {"missing": "#969696", "partial": "#e6b800",
@@ -91,6 +96,9 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
     if points.empty or points.site_id.duplicated().any():
         raise ValueError("Select one nonempty period/scenario with unique coastal points.")
     result = folium.Map(location=[15, 0], zoom_start=2, tiles=None, prefer_canvas=True)
+    # Bootstrap's global styles are unnecessary for these circle-marker maps.
+    result.default_js = [entry for entry in result.default_js if entry[0] in {"leaflet", "jquery"}]
+    result.default_css = [entry for entry in result.default_css if entry[0] == "leaflet_css"]
     folium.Figure(height=600).add_child(result)
     result.get_root().header.add_child(folium.Element(
         "<style>.leaflet-container {background:#bfd2d9 !important;}</style>"))
@@ -142,6 +150,109 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
         f'<details open><summary><b>{title}</b></summary>{rows}{thresholds}</details></div>'))
     folium.LayerControl(collapsed=True).add_to(result)
     return result
+
+
+def save_map_html(result: folium.Map, destination: Path) -> None:
+    """Atomically replace a standalone export, retrying filesystem timeouts."""
+    markup = result.get_root().render().encode("utf-8")
+    for attempt in range(3):
+        temporary = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(
+                    dir=destination.parent, prefix=f".{destination.name}.",
+                    suffix=".part", delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(markup)
+            temporary.replace(destination)
+            return
+        except TimeoutError as error:
+            if attempt == 2:
+                raise
+            LOGGER.warning("Map export timed out for %s (attempt %d/3); retrying: %s",
+                           destination, attempt + 1, error)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove temporary map export %s",
+                                   temporary, exc_info=True)
+        time.sleep(2 ** attempt)
+
+
+def notebook_map_html(result: folium.Map) -> str:
+    """Render without frames, keeping Leaflet independent of notebook AMD loaders."""
+    root = result.get_root()
+    root.render()
+    leaflet_url = root.header._children["leaflet"].url.rsplit("/", 1)[0] + "/leaflet-src.esm.js"
+    dependencies = [child.url for name, child in root.header._children.items()
+                    if name != "leaflet" and isinstance(child, JavascriptLink)]
+    header = "".join(child.render() for child in root.header._children.values()
+                     if not isinstance(child, JavascriptLink))
+    name = result.get_name()
+    host = f"{name}_notebook"
+    return f"""
+{header}
+<style>
+#{host} {{position:relative;height:600px;transform:translateZ(0);overflow:hidden;}}
+#{host} #{name} {{width:100% !important;height:100% !important;}}
+</style>
+<div id="{host}" data-operability-map="{name}">
+{root.html.render()}
+<div data-map-status role="status"
+ style="position:absolute;top:10px;left:45px;z-index:10000;background:white;color:#222;padding:8px">
+Loading interactive map...</div>
+</div>
+<script>
+(async () => {{
+    const host = document.getElementById({json.dumps(host)});
+    const status = host.querySelector("[data-map-status]");
+    try {{
+        // Classic Leaflet can register with AMD without creating window.L.
+        const modules = globalThis.__operabilityMapModules ||= {{}};
+        const url = {json.dumps(leaflet_url)};
+        const state = modules[url] ||= {{attempt: 0}};
+        if (!state.promise) {{
+            const source = new URL(url);
+            if (state.attempt) source.searchParams.set("operability_retry", state.attempt);
+            state.attempt++;
+            state.promise = import(source.href).catch(error => {{
+                delete state.promise;
+                throw error;
+            }});
+        }}
+        const L = await state.promise;
+        const scripts = globalThis.__operabilityMapScripts ||= {{}};
+        for (const url of {json.dumps(dependencies)}) {{
+            if (!scripts[url]) {{
+                scripts[url] = new Promise((resolve, reject) => {{
+                    const script = document.createElement("script");
+                    script.src = url;
+                    script.onload = resolve;
+                    script.onerror = () => {{
+                        delete scripts[url];
+                        reject(new Error("Could not load map dependency: " + url));
+                    }};
+                    document.head.appendChild(script);
+                }});
+            }}
+            await scripts[url];
+        }}
+        {root.script.render()}
+        {name}.invalidateSize();
+        host._operabilityMap = {name};
+        host.dataset.mapReady = "true";
+        status.remove();
+    }} catch (error) {{
+        status.setAttribute("role", "alert");
+        status.textContent = "Map could not render: " + error.message +
+            ". Open the exported HTML map in a browser.";
+        console.error(error);
+    }}
+}})();
+</script>
+"""
 
 
 def read_results(root: Path, period: str, table: str = "summary",

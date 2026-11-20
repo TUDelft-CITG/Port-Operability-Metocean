@@ -54,8 +54,10 @@ def main(argv=None) -> int:
             LOGGER.warning("Rebuilding missing local database from workspace receipts.")
         with Registry(args.workspace, create=rebuilding) as registry:
             if args.command != "status":
+                log_directory = registry.database.parent / "logs"
+                log_directory.mkdir(parents=True, exist_ok=True)
                 handler = logging.FileHandler(
-                    registry.root / "logs" / f"session-{time.time_ns()}.log")
+                    log_directory / f"session-{time.time_ns()}.log")
                 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
                 LOGGER.addHandler(handler)
                 try:
