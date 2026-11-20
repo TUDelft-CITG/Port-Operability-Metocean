@@ -91,6 +91,7 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
     if points.empty or points.site_id.duplicated().any():
         raise ValueError("Select one nonempty period/scenario with unique coastal points.")
     result = folium.Map(location=[15, 0], zoom_start=2, tiles=None, prefer_canvas=True)
+    folium.Figure(height=600).add_child(result)
     result.get_root().header.add_child(folium.Element(
         "<style>.leaflet-container {background:#bfd2d9 !important;}</style>"))
     folium.GeoJson(

@@ -256,8 +256,9 @@ def run(registry: Registry, hours: float = 2, workers: int = 2, batch_size: int 
                                 registry.group(region), [job["continent"]], [year],
                                 registry.acquisition_root(region),
                                 request_budget=int(new_request),
-                                max_wait_seconds=max(1, math.ceil(deadline - time.monotonic())))
-                    except TimeoutError:
+                                max_wait_seconds=max(1, math.ceil(deadline - time.monotonic())),
+                                transfer_directory=registry.database.parent / "transfers")
+                    except full.CDSWaitTimeout:
                         LOGGER.info("CDS wait reached the session deadline; saved job will resume.")
                         registry.reconcile(regions=[region], years=[year])
                         break
