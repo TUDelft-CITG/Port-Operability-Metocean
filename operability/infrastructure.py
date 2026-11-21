@@ -18,6 +18,9 @@ from shapely.geometry import MultiPolygon, Polygon, box
 from .analysis import RISK_COLOURS
 
 RISK_ORDER = ["Low", "Medium", "High", "Very high"]
+CONFIDENCE_COLOURS = {
+    "High": "#3b185e", "Medium": "#8057ad", "Low": "#bc92d2", "Likely natural": "#777777",
+}
 GEOD = Geod(ellps="WGS84")
 
 
@@ -225,7 +228,9 @@ def risk_comparison(sites: pd.DataFrame, jetties: pd.DataFrame) -> pd.DataFrame:
 
 def infrastructure_map(hexagons: gpd.GeoDataFrame, sites: pd.DataFrame,
                        land: gpd.GeoDataFrame, resolution: int = 4) -> folium.Map:
-    """Translucent coastal zones and individual sites over switchable map backgrounds."""
+    """Translucent coastal zones and individually toggleable site-confidence layers."""
+    if sites.port_confidence.isna().any() or not sites.port_confidence.isin(CONFIDENCE_COLOURS).all():
+        raise ValueError("Candidate sites contain missing or unknown inventory confidence levels.")
     result = folium.Map(location=[15, 0], zoom_start=2, tiles="OpenStreetMap", prefer_canvas=True)
     result.default_js = [item for item in result.default_js if item[0] in {"leaflet", "jquery"}]
     result.default_css = [item for item in result.default_css if item[0] == "leaflet_css"]
@@ -249,25 +254,33 @@ def infrastructure_map(hexagons: gpd.GeoDataFrame, sites: pd.DataFrame,
         popup=folium.GeoJsonPopup(fields=["hex_id", "risk", "total_availability",
                                          "risk_site_id", "risk_distance_km", "link_status"]),
     ).add_to(result)
-    fields = ["cluster_id", "port_confidence", "jetty_count", "jetty_obb_total_m",
+    fields = ["cluster_id", "port_confidence", "assessment_status", "jetty_count", "jetty_obb_total_m",
               "risk", "risk_distance_km", "link_status"]
     detail = gpd.GeoDataFrame(
         sites[fields], geometry=gpd.points_from_xy(sites.centroid_lon, sites.centroid_lat),
         crs=4326)
-    folium.GeoJson(
-        json.loads(detail.to_json()), name="Individual candidate sites",
-        marker=folium.CircleMarker(
-            radius=2.5, color="#3b185e", weight=.5, fill=True, fill_opacity=.7),
-        popup=folium.GeoJsonPopup(fields=fields),
-    ).add_to(result)
+    for confidence, colour in CONFIDENCE_COLOURS.items():
+        group = detail.loc[detail.port_confidence.eq(confidence)]
+        if group.empty:
+            continue
+        folium.GeoJson(
+            json.loads(group.to_json()),
+            name=(f'Candidate sites: <span style="color:{colour}">{confidence}</span>'
+                  f' ({len(group):,})'),
+            show=True,
+            marker=folium.CircleMarker(
+                radius=2.5, color=colour, weight=.5, fill=True, fill_opacity=.7),
+            popup=folium.GeoJsonPopup(fields=fields),
+        ).add_to(result)
     legend = "".join(f'<div><span style="color:{colour}">&#9632;</span> {risk}</div>'
                      for risk, colour in RISK_COLOURS.items())
     result.get_root().html.add_child(folium.Element(
         '<div style="position:fixed;bottom:25px;left:15px;z-index:9999;'
         'background:white;color:#222;padding:10px;border:1px solid #888">'
-        '<b>Regional operability risk</b>' + legend +
+        '<details open><summary><b>Regional operability risk</b></summary>' + legend +
         f'<div>Risk grid: H3 resolution {resolution}</div>' +
         '<div>Grey: unsupported / missing</div>'
-        '<div>Purple: selected infrastructure</div></div>'))
+        '<div>Candidate-site confidence: open the layers control at top right.</div>'
+        '<div>Likely natural: not confirmed port infrastructure.</div></details></div>'))
     folium.LayerControl(collapsed=True).add_to(result)
     return result
