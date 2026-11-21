@@ -1,0 +1,122 @@
+{
+  "signature": "8891727a1fb184755152ec8faa825109a87236a257bdc5c4874e31e8e024c02f",
+  "settings": {
+    "version": 1,
+    "science_sha256": "54642579adc3f965af1c679b2b585232672a09874fbbb9b6ee56926500996726",
+    "processing_sha256": "5bf87d34f449e93bc84c85f7e0a48f393391679ae24390823872bb1b22773ffe",
+    "scenarios": [
+      {
+        "name": "baseline",
+        "depth_m": 20.0,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "lower_thresholds",
+        "depth_m": 20.0,
+        "wind_limit": 10.8,
+        "wave_limit": 1.5,
+        "ig_limit": 0.04,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "higher_thresholds",
+        "depth_m": 20.0,
+        "wind_limit": 17.2,
+        "wave_limit": 2.5,
+        "ig_limit": 0.06,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "depth_17m",
+        "depth_m": 17,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "depth_16m",
+        "depth_m": 16,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "depth_15m",
+        "depth_m": 15,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.0,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "wind_plus_5pct",
+        "depth_m": 20.0,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.05,
+        "wave_factor": 1.0,
+        "gap_hours": 4
+      },
+      {
+        "name": "waves_plus_5pct",
+        "depth_m": 20.0,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.0,
+        "wave_factor": 1.05,
+        "gap_hours": 4
+      },
+      {
+        "name": "wind_waves_plus_5pct",
+        "depth_m": 20.0,
+        "wind_limit": 13.8,
+        "wave_limit": 2.0,
+        "ig_limit": 0.05,
+        "wind_factor": 1.05,
+        "wave_factor": 1.05,
+        "gap_hours": 4
+      }
+    ],
+    "max_ig_height": 14.6,
+    "max_ig_period": 40
+  },
+  "python": "3.9.6 (default, Oct 19 2026, 19:18:13) \n[Clang 21.0.0 (clang-2100.4.1.1)]",
+  "source_sha256": {
+    "port_operability.py": "54642579adc3f965af1c679b2b585232672a09874fbbb9b6ee56926500996726",
+    "full_study.py": "4c6f8b3af3c4d3817e1ced1eeeef66c7ba0a70c77f31a67299218f6f48122cc0",
+    "operability/analysis.py": "c785cffebb27ef82d37d64a240fb483a5c89b5594df4d5639b0d02cca89bca48",
+    "operability/__init__.py": "ef45faf826565d768997dab820d46d1bb5a46362f4ea56bce4f64eade81eafb7",
+    "operability/products.py": "781f0bb1bc771a667556d358c2a3600f72cd1f8eff07ff848265ad947d367985",
+    "operability/workspace.py": "ab1832c286c23bf42054c71a18a9d434566e06a04f5f509cec03387f7aee8627",
+    "operability/processing.py": "5bf87d34f449e93bc84c85f7e0a48f393391679ae24390823872bb1b22773ffe"
+  },
+  "packages": {
+    "numpy": "2.0.2",
+    "pandas": "2.3.3",
+    "scipy": "1.13.1",
+    "xarray": "2024.7.0",
+    "netCDF4": "1.7.2",
+    "dask": "2024.8.0",
+    "distributed": "2024.8.0",
+    "eccodes": "2.50.1"
+  }
+}
