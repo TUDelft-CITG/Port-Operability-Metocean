@@ -14,8 +14,10 @@ from typing import Optional
 import folium
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from branca.element import JavascriptLink
+from matplotlib.lines import Line2D
 
 import port_operability as model
 from .workspace import Registry
@@ -26,6 +28,9 @@ RISK_COLOURS = {"Low": "#00cc00", "Medium": "#ffff33",
                 "High": "#ff7f50", "Very high": "#d73027"}
 PROGRESS_COLOURS = {"missing": "#969696", "partial": "#e6b800",
                     "complete": "#238b8e", "complete with source gaps": "#d95f02"}
+DRIVER_COLOURS = {"Wind": "#006400", "Short waves": "#ffb450",
+                  "Short & IG waves": "#00bfff", "IG waves": "#c41e79"}
+SEASON_ORDER = ["DJF", "MAM", "JJA", "SON"]
 
 
 def read_progress(root: Path) -> pd.DataFrame:
@@ -78,16 +83,172 @@ def plot_availability(summary: pd.DataFrame, seasonal: pd.DataFrame, scenario: s
     return figure
 
 
+def prepare_seasonal_comparison(summary: pd.DataFrame, seasonal: pd.DataFrame,
+                               scenario: str = "baseline", min_coverage: float = 1.0):
+    """Use the same observed sites for the whole period and all four seasons."""
+    if not np.isfinite(min_coverage) or not 0 <= min_coverage <= 1:
+        raise ValueError("Minimum observation coverage must be between zero and one.")
+    if summary.empty or seasonal.empty:
+        LOGGER.warning("No stored summary/seasonal results for the comparison.")
+        return summary.iloc[:0].copy(), seasonal.iloc[:0].copy()
+    selected = summary.loc[summary.scenario.eq(scenario)].copy()
+    seasons = seasonal.loc[seasonal.scenario.eq(scenario)].copy()
+    if selected.empty or seasons.empty:
+        LOGGER.warning("No stored summary/seasonal results for scenario %s.", scenario)
+        return selected.iloc[:0], seasons.iloc[:0]
+    if selected.site_id.duplicated().any() or seasons.duplicated(["site_id", "season"]).any():
+        raise ValueError("Select unique sites and one row per site/season.")
+    for column in ["period", "method_signature"]:
+        if (selected[column].nunique() != 1 or seasons[column].nunique() != 1
+                or selected[column].iloc[0] != seasons[column].iloc[0]):
+            raise ValueError(f"Summary and seasonal results must share one {column}.")
+    if not seasons.season.isin(SEASON_ORDER).all():
+        raise ValueError("Unknown or missing seasonal label.")
+    availability = ["total_availability", "wind_availability",
+                    "short_wave_availability", "ig_availability"]
+    if (not selected.coverage_fraction.between(0, 1).all()
+            or not selected[availability].apply(lambda column: column.between(0, 100)).all().all()
+            or not seasons[availability].apply(lambda column: column.between(0, 100)).all().all()
+            or not np.isfinite(seasons[["frequency_per_season", "duration"]]).all().all()):
+        raise ValueError("Missing or invalid availability, coverage or seasonal statistics.")
+    complete = seasons.groupby("site_id").season.nunique().eq(len(SEASON_ORDER))
+    eligible = complete.index[complete]
+    initial_count = len(selected)
+    selected = selected.loc[
+        selected.coverage_fraction.ge(min_coverage) & selected.site_id.isin(eligible)].copy()
+    if len(selected) < initial_count:
+        LOGGER.warning(
+            "Seasonal comparison excludes %d sites below coverage %.3f or missing a season.",
+            initial_count - len(selected), min_coverage)
+    seasons = seasons.loc[seasons.site_id.isin(selected.site_id)].copy()
+    if selected.empty:
+        return selected, seasons
+    reference = selected[["site_id", "total_availability", "coverage_fraction"]].rename(
+        columns={"total_availability": "overall_availability"})
+    seasons = seasons.merge(reference, on="site_id", validate="many_to_one")
+    seasons["availability_difference_pp"] = seasons.total_availability - seasons.overall_availability
+    seasons["risk"] = model.risk_class(seasons.total_availability)
+    seasons["main_driver"] = seasons.apply(model.main_driver, axis=1)
+    return selected, seasons
+
+
+def seasonal_statistics(summary: pd.DataFrame, seasonal: pd.DataFrame) -> pd.DataFrame:
+    """Thesis Table 4.11-style equal-site means for a prepared, matched cohort."""
+    if summary.empty or seasonal.empty:
+        raise ValueError("No matched seasonal comparison results.")
+    availability = ["total_availability", "wind_availability",
+                    "short_wave_availability", "ig_availability"]
+    result = seasonal.groupby("season")[availability + [
+        "frequency_per_season", "duration", "availability_difference_pp"]].mean().reindex(SEASON_ORDER)
+    result = result.rename(columns={"frequency_per_season": "events_per_year"})
+    result["sites"] = seasonal.groupby("season").site_id.nunique().reindex(SEASON_ORDER)
+    overall = summary[availability + ["frequency", "duration"]].mean().rename(
+        {"frequency": "events_per_year"})
+    overall["availability_difference_pp"] = 0.0
+    overall["sites"] = len(summary)
+    result.loc[summary.period.iloc[0]] = overall
+    result["sites"] = result.sites.astype(int)
+    result.index.name = "season_or_period"
+    return result
+
+
+def _world_axis(axis, countries: gpd.GeoDataFrame, title: str):
+    countries.plot(ax=axis, facecolor="#eeefee", edgecolor="#888", linewidth=.3, zorder=0)
+    axis.set(xlim=(-180, 180), ylim=(-90, 90), facecolor="#bfd2d9",
+             xlabel="Longitude", ylabel="Latitude", title=title)
+    axis.set_aspect("equal", adjustable="box")
+
+
+def _availability_scatter(axis, points: pd.DataFrame, column: str):
+    values = points[column]
+    if not values.between(0, 100).all():
+        raise ValueError("Availability maps require finite percentages between zero and 100.")
+    colours = model.risk_class(values).map(RISK_COLOURS).astype(object)
+    return axis.scatter(points.lon, points.lat, c=colours, s=10,
+                        edgecolors="#333", linewidths=.2, zorder=2, rasterized=True)
+
+
+def _availability_legend(figure):
+    labels = ["Low risk: >95%", "Medium: >85-95%", "High: >75-85%", "Very high: <=75%"]
+    handles = [Line2D([], [], linestyle="", marker="o", markerfacecolor=colour,
+                      markeredgecolor="#333", label=label)
+               for colour, label in zip(RISK_COLOURS.values(), labels)]
+    figure.legend(handles=handles, loc="lower center", ncol=4, title="Conditional availability")
+
+
+def plot_indicator_maps(summary: pd.DataFrame, countries: gpd.GeoDataFrame):
+    """Four stored dominant-driver groups, using the paper's Figure 6 palette."""
+    if summary.empty:
+        raise ValueError("No calculated driver results.")
+    if not summary.main_driver.isin(DRIVER_COLOURS).all():
+        raise ValueError("Unknown or missing stored main-driver class.")
+    figure, axes = plt.subplots(2, 2, figsize=(16, 10))
+    drivers = ["Wind", "Short waves", "IG waves", "Short & IG waves"]
+    for axis, driver in zip(axes.flat, drivers):
+        points = summary.loc[summary.main_driver.eq(driver)]
+        _world_axis(axis, countries, f"{driver}: {len(points):,} sites")
+        axis.scatter(points.lon, points.lat, color=DRIVER_COLOURS[driver], s=10,
+                     edgecolors="#333", linewidths=.2, zorder=2, rasterized=True)
+    handles = [Line2D([], [], linestyle="", marker="o", markerfacecolor=DRIVER_COLOURS[driver],
+                      markeredgecolor="#333", label=driver) for driver in drivers]
+    figure.legend(handles=handles, loc="lower center", ncol=4,
+                  title="Main driver (not overall operability risk)")
+    figure.suptitle(f"Main causes of inoperability - {summary.period.iloc[0]}")
+    figure.subplots_adjust(top=.92, bottom=.13, hspace=.25)
+    return figure
+
+
+def plot_seasonal_maps(seasonal: pd.DataFrame, countries: gpd.GeoDataFrame,
+                       differences: bool = False):
+    """Four seasonal risk maps or signed departures from the same sites' overall values."""
+    if seasonal.empty:
+        raise ValueError("No matched seasonal results.")
+    figure, axes = plt.subplots(2, 2, figsize=(16, 10))
+    if differences:
+        values = seasonal.availability_difference_pp
+        if not np.isfinite(values).all():
+            raise ValueError("Seasonal differences require finite paired availabilities.")
+        limit = max(1.0, float(values.abs().max()))
+        normalise = plt.Normalize(vmin=-limit, vmax=limit)
+    for axis, season in zip(axes.flat, SEASON_ORDER):
+        points = seasonal.loc[seasonal.season.eq(season)]
+        if points.empty:
+            raise ValueError(f"No matched results for {season}.")
+        _world_axis(axis, countries, season)
+        if differences:
+            scatter = axis.scatter(
+                points.lon, points.lat, c=points.availability_difference_pp,
+                cmap="RdYlGn", norm=normalise, s=10, edgecolors="#333", linewidths=.2,
+                zorder=2, rasterized=True)
+        else:
+            _availability_scatter(axis, points, "total_availability")
+    title = "Seasonal departure from whole-period availability" if differences else "Seasonal operability risk"
+    figure.suptitle(f"{title} - {seasonal.period.iloc[0]}")
+    figure.subplots_adjust(top=.92, bottom=.13, hspace=.25)
+    if differences:
+        figure.colorbar(scatter, ax=list(axes.flat), orientation="horizontal",
+                        fraction=.04, pad=.1, label="Season minus whole period (percentage points)")
+    else:
+        _availability_legend(figure)
+    return figure
+
+
 def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "progress",
              scenario: str = "baseline") -> folium.Map:
     """Return an embedded, tile-free progress or calculated-result map; never export HTML."""
-    if kind not in {"progress", "availability"}:
-        raise ValueError("Map kind must be progress or availability.")
+    if kind not in {"progress", "availability", "driver"}:
+        raise ValueError("Map kind must be progress, availability or driver.")
     points = points.copy()
-    if kind == "availability":
+    if kind in {"availability", "driver"}:
         points = points.loc[points.scenario.eq(scenario)]
-        colours, title = RISK_COLOURS, "Calculated operability risk"
-        points["map_class"] = points.risk
+        if kind == "driver":
+            colours, title = DRIVER_COLOURS, "Main cause of inoperability"
+            points["map_class"] = points.main_driver
+            if not points.map_class.isin(colours).all():
+                raise ValueError("Unknown or missing stored main-driver class.")
+        else:
+            colours, title = RISK_COLOURS, "Calculated operability risk"
+            points["map_class"] = points.risk
     else:
         colours, title = PROGRESS_COLOURS, "Extraction progress"
         points["map_class"] = points.extraction_status
@@ -95,6 +256,11 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
                    "map_class"] = "complete with source gaps"
     if points.empty or points.site_id.duplicated().any():
         raise ValueError("Select one nonempty period/scenario with unique coastal points.")
+    is_seasonal = "season" in points.columns
+    if is_seasonal:
+        if points.season.nunique() != 1 or not points.season.isin(SEASON_ORDER).all():
+            raise ValueError("Select one season for an interactive map.")
+        title += f" - {points.season.iloc[0]}"
     result = folium.Map(location=[15, 0], zoom_start=2, tiles=None, prefer_canvas=True)
     # Bootstrap's global styles are unnecessary for these circle-marker maps.
     result.default_js = [entry for entry in result.default_js if entry[0] in {"leaflet", "jquery"}]
@@ -113,16 +279,26 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
         layer = folium.FeatureGroup(name=label)
         for point in points.loc[points.map_class.eq(label)].itertuples(index=False):
             popup = f"<b>Site {point.site_id}</b><br>{escape(point.country)}<br>"
-            if kind == "availability":
+            if kind in {"availability", "driver"}:
                 popup += (
                     f"Period: {escape(point.period)}<br>Scenario: {escape(scenario)}<br>"
-                    f"Availability: {point.total_availability:.2f}%<br>Risk: {escape(label)}<br>"
+                    f"Availability: {point.total_availability:.2f}%<br>Risk: {escape(str(point.risk))}<br>"
                     f"Main driver: {escape(point.main_driver)}<br>"
                     f"Wind: {point.wind_availability:.2f}%<br>"
                     f"Short waves: {point.short_wave_availability:.2f}%<br>"
-                    f"IG waves: {point.ig_availability:.2f}%<br>"
-                    f"Events/year: {point.frequency:.2f}<br>Mean duration: {point.duration:.1f} h<br>"
-                    f"Valid hours: {int(point.observed_hours):,}/{int(point.expected_hours):,}")
+                    f"IG waves: {point.ig_availability:.2f}%<br>")
+                if is_seasonal:
+                    popup += (
+                        f"Season: {escape(point.season)}<br>"
+                        f"Difference from whole period: {point.availability_difference_pp:+.2f} pp<br>"
+                        f"Events/year in this season: {point.frequency_per_season:.2f}<br>"
+                        f"Mean duration: {point.duration:.1f} h<br>"
+                        f"Observed seasonal hours: {int(point.observed_hours):,}<br>"
+                        f"Whole-period coverage: {point.coverage_fraction:.1%}")
+                else:
+                    popup += (
+                        f"Events/year: {point.frequency:.2f}<br>Mean duration: {point.duration:.1f} h<br>"
+                        f"Valid hours: {int(point.observed_hours):,}/{int(point.expected_hours):,}")
             else:
                 popup += (
                     f"Extraction: {escape(label)}<br>"
@@ -144,6 +320,10 @@ def make_map(points: pd.DataFrame, countries: gpd.GeoDataFrame, kind: str = "pro
         for label, colour in colours.items())
     thresholds = ("<div>Low &gt;95%; Medium &gt;85-95%;<br>High &gt;75-85%; Very high &lt;=75%</div>"
                   if kind == "availability" else "")
+    if kind == "driver":
+        thresholds = ("<div>Lowest individual conditional availability.</div>"
+                      "<div>Short &amp; IG waves: gap &lt;1 percentage point unless wind is lower.</div>"
+                      "<div>Driver availabilities overlap; these are not additive downtime shares.</div>")
     result.get_root().html.add_child(folium.Element(
         '<div style="position:fixed;bottom:25px;left:15px;z-index:9999;background:white;'
         'padding:9px;border:1px solid #888;border-radius:4px;font-size:12px">'

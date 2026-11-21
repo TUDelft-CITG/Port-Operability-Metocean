@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pandas as pd
 import requests
 import xarray as xr
 from shapely.geometry import box
@@ -17,8 +18,9 @@ from shapely.geometry import box
 import full_study as full
 import process_global
 from operability.analysis import (
-    load_land, make_map, notebook_map_html, plot_availability, read_progress, read_results,
-    save_map_html,
+    DRIVER_COLOURS, RISK_COLOURS, SEASON_ORDER, load_land, make_map, notebook_map_html,
+    plot_availability, plot_indicator_maps, plot_seasonal_maps, prepare_seasonal_comparison,
+    read_progress, read_results, save_map_html, seasonal_statistics,
 )
 from operability.processing import run
 from operability.workspace import Registry, assign_regions, initialise, product_path
@@ -93,6 +95,135 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(markup, r'^<iframe\b[^>]* height="[1-9][0-9]*"')
         self.assertNotIn("padding-bottom:", markup)
         self.assertEqual(result.get_root().render().count("L.circleMarker("), 2)
+
+    def comparison_data(self):
+        summary = pd.DataFrame({
+            "site_id": [1, 2, 3], "lon": [18., 18.5, 19.], "lat": [-34.] * 3,
+            "country": ["Example"] * 3, "scenario": ["baseline"] * 3,
+            "period": ["year_2025"] * 3, "method_signature": ["one-method"] * 3,
+            "coverage_fraction": [1., .5, 1.], "total_availability": [95., 80., 90.],
+            "wind_availability": [99.] * 3, "short_wave_availability": [95.] * 3,
+            "ig_availability": [95.5] * 3, "main_driver": ["Short & IG waves"] * 3,
+            "risk": ["Medium", "High", "Medium"], "frequency": [7., 8., 9.],
+            "duration": [12.] * 3, "observed_hours": [8760, 4380, 8760],
+            "expected_hours": [8760] * 3,
+        })
+        rows = []
+        for point in summary.to_dict("records"):
+            for season, availability in zip(SEASON_ORDER, [90., 95., 100., 95.]):
+                if point["site_id"] == 3 and season == "SON":
+                    continue
+                rows.append({
+                    **{key: point[key] for key in [
+                        "site_id", "lon", "lat", "country", "scenario", "period", "method_signature"]},
+                    "season": season, "total_availability": availability,
+                    "wind_availability": 99., "short_wave_availability": 95.,
+                    "ig_availability": 95.5, "frequency": 80.,
+                    "frequency_per_season": 2., "duration": 10., "observed_hours": 2160,
+                })
+        return summary, pd.DataFrame(rows)
+
+    def test_seasonal_comparison_pairs_sites_and_uses_calendar_season_frequency(self):
+        summary, seasons = self.comparison_data()
+        original = seasons.copy()
+        with self.assertLogs("operability", level="WARNING"):
+            overall, matched = prepare_seasonal_comparison(summary, seasons)
+        self.assertEqual(overall.site_id.tolist(), [1])
+        self.assertEqual(matched.site_id.tolist(), [1] * 4)
+        self.assertEqual(matched.availability_difference_pp.tolist(), [-5., 0., 5., 0.])
+        self.assertEqual(matched.main_driver.tolist(), ["Short & IG waves"] * 4)
+        table = seasonal_statistics(overall, matched)
+        self.assertEqual(table.loc["DJF", "events_per_year"], 2.)
+        self.assertEqual(table.loc["year_2025", "events_per_year"], 7.)
+        self.assertEqual(table.loc["DJF", "availability_difference_pp"], -5.)
+        self.assertEqual(table.sites.tolist(), [1] * 5)
+        pd.testing.assert_frame_equal(seasons, original)
+        with self.assertLogs("operability", level="WARNING"):
+            relaxed, _ = prepare_seasonal_comparison(summary, seasons, min_coverage=.5)
+        self.assertEqual(relaxed.site_id.tolist(), [1, 2])
+
+    def test_seasonal_comparison_rejects_ambiguous_or_mixed_results(self):
+        summary, seasons = self.comparison_data()
+        for invalid in [pd.concat([seasons, seasons.iloc[[0]]]),
+                        seasons.assign(period="year_2024"),
+                        seasons.assign(method_signature="another-method"),
+                        seasons.assign(season="unknown")]:
+            with self.subTest(invalid=invalid.iloc[0].to_dict()), self.assertRaises(ValueError):
+                prepare_seasonal_comparison(summary, invalid)
+
+    def test_driver_and_season_maps_keep_risk_and_frequency_popup_meanings(self):
+        import folium
+
+        summary, seasons = self.comparison_data()
+        land = gpd.read_file(self.countries)
+        points = pd.concat([summary.iloc[[0]].assign(site_id=i + 10, main_driver=driver)
+                            for i, driver in enumerate(DRIVER_COLOURS)], ignore_index=True)
+        result = make_map(points, land, kind="driver")
+        groups = [layer for layer in result._children.values()
+                  if isinstance(layer, folium.FeatureGroup)]
+        self.assertEqual([layer.layer_name for layer in groups], list(DRIVER_COLOURS))
+        for group, colour in zip(groups, DRIVER_COLOURS.values()):
+            marker = next(iter(group._children.values()))
+            self.assertEqual(marker.options["fillColor"], colour)
+        markup = result.get_root().render()
+        self.assertEqual(markup.count("L.circleMarker("), 4)
+        self.assertNotIn("Risk: Wind", markup)
+        self.assertIn("Risk: Medium", markup)
+        with self.assertLogs("operability", level="WARNING"):
+            _, matched = prepare_seasonal_comparison(summary, seasons)
+        markup = make_map(matched.loc[matched.season.eq("DJF")], land,
+                          kind="availability").get_root().render()
+        self.assertIn("Season: DJF", markup)
+        self.assertIn("Events/year in this season: 2.00", markup)
+        self.assertIn("Observed seasonal hours: 2,160", markup)
+        self.assertIn("Difference from whole period: -5.00 pp", markup)
+        with self.assertRaises(ValueError):
+            make_map(matched, land, kind="availability")
+
+    def test_seasonal_figures_preserve_class_boundaries_and_signed_shared_scale(self):
+        from matplotlib.colors import to_hex
+        import matplotlib.pyplot as plt
+
+        summary, seasons = self.comparison_data()
+        seasons = seasons.loc[seasons.site_id.eq(1)].copy()
+        seasons["total_availability"] = [75., 85., 95., 100.]
+        overall, matched = prepare_seasonal_comparison(summary.iloc[[0]], seasons)
+        land = gpd.read_file(self.countries)
+        figures = [plot_indicator_maps(overall, land), plot_seasonal_maps(matched, land),
+                   plot_seasonal_maps(matched, land, differences=True)]
+        for figure in figures:
+            self.addCleanup(plt.close, figure)
+        self.assertEqual(len(figures[0].axes), 4)
+        self.assertEqual(len(figures[1].axes), 4)
+        for axis, risk in zip(figures[1].axes, ["Very high", "High", "Medium", "Low"]):
+            self.assertEqual(to_hex(axis.collections[-1].get_facecolors()[0]), RISK_COLOURS[risk])
+        for axis, difference in zip(figures[2].axes[:4], [-20., -10., 0., 5.]):
+            scatter = axis.collections[-1]
+            self.assertEqual(scatter.get_array().tolist(), [difference])
+            self.assertEqual(scatter.get_clim(), (-20., 20.))
+            np.testing.assert_allclose(scatter.get_offsets(), [[18., -34.]])
+
+    def test_driver_panels_partition_stored_classes_in_two_by_two_layout(self):
+        from matplotlib.colors import to_hex
+        import matplotlib.pyplot as plt
+
+        summary, _ = self.comparison_data()
+        drivers = ["Wind", "Short waves", "IG waves", "Short & IG waves"]
+        points = pd.concat([
+            summary.iloc[[0]].assign(site_id=i + 10, lon=18. + i, main_driver=driver)
+            for i, driver in enumerate(drivers)], ignore_index=True)
+        figure = plot_indicator_maps(points, gpd.read_file(self.countries))
+        self.addCleanup(plt.close, figure)
+        self.assertEqual(len(figure.axes), 4)
+        for i, (axis, driver) in enumerate(zip(figure.axes, drivers)):
+            layout = axis.get_subplotspec().get_gridspec()
+            self.assertEqual((layout.nrows, layout.ncols), (2, 2))
+            scatter = axis.collections[-1]
+            np.testing.assert_allclose(scatter.get_offsets(), [[18. + i, -34.]])
+            self.assertEqual(to_hex(scatter.get_facecolors()[0]), DRIVER_COLOURS[driver])
+            self.assertEqual(axis.get_title(), f"{driver}: 1 sites")
+        with self.assertRaisesRegex(ValueError, "main-driver"):
+            plot_indicator_maps(points.assign(main_driver="unknown"), gpd.read_file(self.countries))
 
     def test_map_export_retries_partial_write_and_closes_files(self):
         destination = self.base / "maps/progress.html"
